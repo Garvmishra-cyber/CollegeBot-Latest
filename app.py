@@ -1,6 +1,7 @@
 import os
 import json
 import sqlite3
+import time
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -14,7 +15,7 @@ from dotenv import load_dotenv
 # ENVIRONMENT
 # ============================================================
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 # ============================================================
@@ -343,190 +344,200 @@ def ask_gemini(
 ):
 
     if not GEMINI_API_KEY:
-
         return None, "Gemini API key is not configured."
 
-    try:
+    contents = []
 
-        contents = []
+    # Keep the existing conversation context.
+    if history:
+        for item in history[-10:]:
+            user_message = item.get("user_message", "")
+            bot_response = item.get("bot_response", "")
 
-        # ----------------------------------------------------
-        # OLD MESSAGES
-        # ----------------------------------------------------
+            if user_message:
+                contents.append({
+                    "role": "user",
+                    "parts": [{"text": user_message}]
+                })
 
-        if history:
+            if bot_response:
+                contents.append({
+                    "role": "model",
+                    "parts": [{"text": bot_response}]
+                })
 
-            for item in history[-10:]:
+    contents.append({
+        "role": "user",
+        "parts": [{"text": message}]
+    })
 
-                user_message = item.get(
-                    "user_message",
-                    ""
-                )
-
-                bot_response = item.get(
-                    "bot_response",
-                    ""
-                )
-
-                if user_message:
-
-                    contents.append({
-                        "role": "user",
-                        "parts": [
-                            {
-                                "text": user_message
-                            }
-                        ]
-                    })
-
-                if bot_response:
-
-                    contents.append({
-                        "role": "model",
-                        "parts": [
-                            {
-                                "text": bot_response
-                            }
-                        ]
-                    })
-
-        # ----------------------------------------------------
-        # CURRENT MESSAGE
-        # ----------------------------------------------------
-
-        contents.append({
-            "role": "user",
-            "parts": [
-                {
-                    "text": message
-                }
-            ]
-        })
-
-        # ----------------------------------------------------
-        # PAYLOAD
-        # ----------------------------------------------------
-
-        payload = {
-
-            "systemInstruction": {
-                "parts": [
-                    {
-                        "text": build_system_prompt(
-                            settings
-                        )
-                    }
-                ]
-            },
-
-            "contents": contents,
-
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 2048
-            }
+    payload = {
+        "systemInstruction": {
+            "parts": [{
+                "text": build_system_prompt(settings)
+            }]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 2048
         }
+    }
 
-        body = json.dumps(
-            payload
-        ).encode("utf-8")
+    body = json.dumps(payload).encode("utf-8")
 
-        req = Request(
-            GEMINI_URL,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY
-            }
+    # Try configured/common models first. If this API key cannot access
+    # them, discover models actually available to this key and try those
+    # that support generateContent.
+    models_to_try = []
+    for candidate in (
+        GEMINI_MODEL,
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash",
+    ):
+        candidate = candidate.strip()
+        if candidate and candidate not in models_to_try:
+            models_to_try.append(candidate)
+
+    last_error = "Gemini did not return a response."
+    tried_models = set()
+    discovered_models_added = False
+
+    while True:
+        # Run through the current list. If every listed model returns 404,
+        # ask Google's Models API which models this API key can actually use.
+        pending_models = [m for m in models_to_try if m not in tried_models]
+        if not pending_models:
+            if discovered_models_added:
+                break
+            discovered_models_added = True
+            try:
+                list_req = Request(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    method="GET",
+                    headers={
+                        "x-goog-api-key": GEMINI_API_KEY,
+                        "User-Agent": "CollegeBot/1.0",
+                    },
+                )
+                with urlopen(list_req, timeout=15) as list_response:
+                    available_data = json.loads(
+                        list_response.read().decode("utf-8")
+                    )
+                available = []
+                for item in available_data.get("models", []):
+                    name = str(item.get("name", ""))
+                    methods = item.get("supportedGenerationMethods", [])
+                    if name.startswith("models/"):
+                        name = name[len("models/"):]
+                    if name and "generateContent" in methods:
+                        available.append(name)
+                # Prefer Flash models, then any other model that explicitly
+                # supports generateContent for this key.
+                available.sort(key=lambda name: ("flash" not in name.lower(), name))
+                for candidate in available:
+                    if candidate not in models_to_try:
+                        models_to_try.append(candidate)
+                pending_models = [m for m in models_to_try if m not in tried_models]
+            except Exception as list_error:
+                last_error += f"; model discovery failed: {list_error}"
+                break
+            if not pending_models:
+                break
+
+        model_name = pending_models[0]
+        tried_models.add(model_name)
+        model_url = (
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/models/{model_name}:generateContent"
         )
 
-        with urlopen(
-            req,
-            timeout=30
-        ) as response:
-
-            raw = response.read().decode(
-                "utf-8"
+        for attempt in range(2):
+            req = Request(
+                model_url,
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": GEMINI_API_KEY
+                }
             )
 
-        result = json.loads(raw)
+            try:
+                with urlopen(req, timeout=45) as response:
+                    raw = response.read().decode("utf-8")
 
-        # ----------------------------------------------------
-        # GET CANDIDATE
-        # ----------------------------------------------------
+                result = json.loads(raw)
 
-        candidates = result.get(
-            "candidates",
-            []
-        )
+                # Some gateways report temporary unavailability in JSON.
+                api_error = result.get("error", {})
+                if api_error:
+                    error_message = api_error.get(
+                        "message",
+                        str(api_error)
+                    )
+                    error_status = str(api_error.get("status", "")).upper()
+                    last_error = f"Gemini error: {error_message}"
 
-        if not candidates:
+                    if error_status in ("UNAVAILABLE", "RESOURCE_EXHAUSTED") and attempt == 0:
+                        time.sleep(1.5)
+                        continue
 
-            return None, "Gemini returned no candidates."
+                    break
 
-        content = candidates[0].get(
-            "content",
-            {}
-        )
+                candidates = result.get("candidates", [])
+                if not candidates:
+                    last_error = "Gemini returned no candidates."
+                    break
 
-        parts = content.get(
-            "parts",
-            []
-        )
+                parts = candidates[0].get("content", {}).get("parts", [])
+                answer = "\n".join(
+                    part.get("text", "")
+                    for part in parts
+                    if part.get("text")
+                ).strip()
 
-        answer_parts = []
+                if answer:
+                    return answer, None
 
-        for part in parts:
+                last_error = "Gemini returned an empty response."
+                break
 
-            text = part.get(
-                "text",
-                ""
-            )
+            except HTTPError as e:
+                try:
+                    error_text = e.read().decode(
+                        "utf-8",
+                        errors="ignore"
+                    )
+                except Exception:
+                    error_text = ""
 
-            if text:
+                last_error = (
+                    f"Gemini HTTP Error {e.code}: "
+                    f"{error_text[:500]}"
+                )
 
-                answer_parts.append(text)
+                # Retry temporary overload/rate-limit/server errors.
+                if e.code in (429, 500, 502, 503, 504) and attempt == 0:
+                    time.sleep(1.5)
+                    continue
 
-        answer = "\n".join(
-            answer_parts
-        ).strip()
+                break
 
-        if not answer:
+            except URLError as e:
+                last_error = f"Gemini network error: {e}"
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                break
 
-            return None, "Gemini returned empty response."
+            except Exception as e:
+                last_error = f"Gemini error: {e}"
+                break
 
-        return answer, None
-
-    except HTTPError as e:
-
-        try:
-
-            error_text = e.read().decode(
-                "utf-8",
-                errors="ignore"
-            )
-
-        except Exception:
-
-            error_text = ""
-
-        return None, (
-            f"Gemini HTTP Error {e.code}: "
-            f"{error_text[:500]}"
-        )
-
-    except URLError as e:
-
-        return None, (
-            f"Gemini network error: {e}"
-        )
-
-    except Exception as e:
-
-        return None, (
-            f"Gemini error: {e}"
-        )
+    return None, last_error
 
 
 # ============================================================

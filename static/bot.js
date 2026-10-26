@@ -2439,8 +2439,7 @@ Batao, main aapki kya help karun? 😊`
             false;
 
 
-        recognition.lang =
-            "hi-IN";
+        recognition.lang = "en-IN";
 
 
         recognition.onstart =
@@ -2533,11 +2532,7 @@ Batao, main aapki kya help karun? 😊`
 
         try {
 
-            recognition.lang =
-                settings.language ===
-                "English"
-                    ? "en-IN"
-                    : "hi-IN";
+            recognition.lang = "en-IN";
 
 
             recognition.start();
